@@ -25,6 +25,7 @@ add_mlir_library(MLIRTestIR
   TestUseListOrders.cpp
   TestVisitors.cpp
   TestVisitorsGeneric.cpp
+  TestDialectCounts.cpp
 
   EXCLUDE_FROM_LIBMLIR
 
