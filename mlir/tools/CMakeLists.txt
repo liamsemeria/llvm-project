@@ -10,6 +10,8 @@ add_subdirectory(mlir-translate)
 add_subdirectory(tblgen-lsp-server)
 add_subdirectory(tblgen-to-irdl)
 
+add_subdirectory(visualize-opt)
+
 # mlir-runner requires ExecutionEngine.
 if(MLIR_ENABLE_EXECUTION_ENGINE)
   add_subdirectory(mlir-runner)
