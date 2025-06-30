@@ -356,10 +356,11 @@ int main(int argc, char **argv) {
             n = s.find(',');
             if (n == -1) break;
             // add the next pass in the pipeline
-            r += s.substr(0, n+1) + "test-dialect-counts,";
+            r += s.substr(0, n+1) + "test-dialect-counts{print-msg=\"" + s.substr(0,n) + "\"},";
           }
           // add the final visualization pass
-          s = r + s.substr(0,s.size()-1) + ",test-dialect-counts)";
+          s = r + s.substr(0,s.size()-1) + ",test-dialect-counts{print-msg=\"" + s.substr(0,s.size()-1) + "\"})";
+          llvm::outs() << s << "\n";
           new_argv[i] = new char[s.size()+1];
           strcpy(new_argv[i], (char*)s.c_str());
 
