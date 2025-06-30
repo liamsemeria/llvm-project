@@ -28,47 +28,55 @@ namespace {
 
         void runOnOperation() override {
             if (! printMsg.empty()) 
-                llvm::outs() << printMsg << "\n";
+                llvm::outs() << "\n" << printMsg << "\n";
 
-            // Get the current operation being operated on.
-            Operation *op = getOperation();
-            std::map<StringRef, int> dialect_counts;
-            std::map<StringRef, std::string> dialect_colors;
-
-            run(op, dialect_counts, dialect_colors);
+            // walk starting at the main op
+            getOperation()->walk([this](Operation *o) {
+                run(o);
+            });
 
             // print the color key
             llvm::outs() << "\n";
-            for (auto iter : dialect_counts) {
-                llvm::outs() << dialect_colors[iter.first] << iter.first << ": " << iter.second << " ";
+            for (auto iter : dialectCounts) {
+                llvm::outs() << dialectColors[iter.first] << iter.first << ": " << iter.second << " ";
             }
             llvm::outs() << "\n";
         }
+        private:
+        std::map<StringRef, int> dialectCounts;
+        std::map<StringRef, std::string> dialectColors;
 
-        void run(Operation *op,std::map<StringRef, int>& dialect_counts, std::map<StringRef, std::string>& dialect_colors) {
+        void run(Operation *op) {
             // count the dialect for the operation
             StringRef s = op->getDialect()->getNamespace();
             
 
-            if (dialect_counts.find(s) == dialect_counts.end()) {
-                dialect_counts[s] = 1;
+            if (dialectCounts.find(s) == dialectCounts.end()) {
+                dialectCounts[s] = 1;
+                int offset = 0;
                 // get color hash and create format string
-                std::string suffix = "m \033[0m";
-                std::string f = "\033[48;5;" + std::to_string((int)(llvm::hash_value(s) % 230 + 1)) + suffix;
-                dialect_colors[s] = f;
-            } else
-                dialect_counts[s]++;
-            
-            llvm::outs() << dialect_colors[s];
-            
-            // traverse operations
-            for (Region &r : op->getRegions()) {
-                for (Block &b : r.getBlocks()) {
-                    for (Operation &o : b.getOperations()) {
-                        run(&o, dialect_counts, dialect_colors);
+                std::string f = getDialectColor(s);
+                // make sure the color is unique, if not, rehash
+                bool clone = true;
+                while (clone) {
+                    for (auto iter : dialectColors) {
+                        if (f == iter.second) {
+                            f = getDialectColor(s,offset++);
+                            break;
+                        }
                     }
+                    clone = false;
                 }
-            }
+                dialectColors[s] = f;
+            } else
+                dialectCounts[s]++;
+            
+            llvm::outs() << dialectColors[s];
+        }
+
+        // get the color for a dialect, set offset to nonzero if a rehash is needed
+        std::string getDialectColor(StringRef dialectName, int offset = 0) {
+            return "\033[48;5;" + std::to_string((int)((llvm::hash_value(dialectName) + offset) % 230 + 1)) + "m \033[0m";
         }
     };
 }
