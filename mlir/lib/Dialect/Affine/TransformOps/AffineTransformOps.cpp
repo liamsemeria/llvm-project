@@ -8,18 +8,344 @@
 
 #include "mlir/Dialect/Affine/TransformOps/AffineTransformOps.h"
 #include "mlir/Dialect/Affine/Analysis/AffineStructures.h"
+#include "mlir/Dialect/Affine/Analysis/LoopAnalysis.h"
 #include "mlir/Dialect/Affine/Analysis/Utils.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/IR/AffineValueMap.h"
 #include "mlir/Dialect/Affine/LoopUtils.h"
 #include "mlir/Dialect/Affine/Transforms/Transforms.h"
+#include "mlir/Dialect/Affine/Utils.h"
 #include "mlir/Dialect/Transform/IR/TransformDialect.h"
 #include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "llvm/ADT/ArrayRef.h"
+#include <cstdint>
+#include <limits>
 
 using namespace mlir;
 using namespace mlir::affine;
 using namespace mlir::transform;
+
+//===----------------------------------------------------------------------===//
+// TileOp
+//===----------------------------------------------------------------------===//
+
+DiagnosedSilenceableFailure
+TileOp::apply(transform::TransformRewriter &rewriter, TransformResults &results,
+              TransformState &state) {
+  auto payload = state.getPayloadOps(getTarget());
+  if (!llvm::hasSingleElement(payload))
+    return emitSilenceableError()
+           << "expected exactly one affine.for target, found "
+           << llvm::range_size(payload);
+
+  auto target = dyn_cast<AffineForOp>(*payload.begin());
+  if (!target) {
+    auto diag = emitSilenceableError()
+                << "expected target to be an affine.for operation";
+    diag.attachNote((*payload.begin())->getLoc()) << "target payload op";
+    return diag;
+  }
+
+  SmallVector<AffineForOp> nest;
+  getPerfectlyNestedLoops(nest, target);
+  if (getDimensions().size() != getTileSizes().size()) {
+    auto diag = emitSilenceableError()
+                << "expected dimensions and tile sizes to have equal lengths, "
+                   "found "
+                << getDimensions().size() << " and " << getTileSizes().size();
+    diag.attachNote(target.getLoc()) << "target payload op";
+    return diag;
+  }
+
+  SmallVector<unsigned> dimensions;
+  SmallVector<unsigned> tileSizes;
+  dimensions.reserve(getDimensions().size());
+  tileSizes.reserve(getTileSizes().size());
+  for (auto [dimension, tileSize] :
+       llvm::zip_equal(getDimensions(), getTileSizes())) {
+    if (dimension < 0 || static_cast<uint64_t>(dimension) >= nest.size()) {
+      auto diag = emitSilenceableError()
+                  << "dimension " << dimension
+                  << " is out of range for an affine loop nest of depth "
+                  << nest.size();
+      diag.attachNote(target.getLoc()) << "target payload op";
+      return diag;
+    }
+    if (tileSize <= 0 || static_cast<uint64_t>(tileSize) >
+                             std::numeric_limits<unsigned>::max()) {
+      auto diag = emitSilenceableError()
+                  << "expected positive tile sizes representable as unsigned";
+      diag.attachNote(target.getLoc()) << "target payload op";
+      return diag;
+    }
+    dimensions.push_back(static_cast<unsigned>(dimension));
+    tileSizes.push_back(static_cast<unsigned>(tileSize));
+  }
+
+  SmallVector<unsigned> pointDimensions;
+  std::optional<ArrayRef<int64_t>> inputPointDimensions = getPointDimensions();
+  if (inputPointDimensions) {
+    pointDimensions.reserve(inputPointDimensions->size());
+    for (int64_t dimension : *inputPointDimensions) {
+      if (dimension < 0 || static_cast<uint64_t>(dimension) >= nest.size()) {
+        auto diag = emitSilenceableError()
+                    << "point dimension " << dimension
+                    << " is out of range for an affine loop nest of depth "
+                    << nest.size();
+        diag.attachNote(target.getLoc()) << "target payload op";
+        return diag;
+      }
+      pointDimensions.push_back(static_cast<unsigned>(dimension));
+    }
+    SmallVector<unsigned> sortedPointDimensions(pointDimensions);
+    llvm::sort(sortedPointDimensions);
+    if (pointDimensions.size() != nest.size() ||
+        llvm::any_of(llvm::enumerate(sortedPointDimensions),
+                     [](auto entry) {
+                       return entry.index() != entry.value();
+                     })) {
+      auto diag = emitSilenceableError()
+                  << "expected point_dimensions to be a permutation of all "
+                     "source dimensions";
+      diag.attachNote(target.getLoc()) << "target payload op";
+      return diag;
+    }
+  }
+
+  if (llvm::any_of(
+          nest, [](AffineForOp loop) { return loop.getNumResults() != 0; })) {
+    auto diag = emitSilenceableError()
+                << "affine loop tiling does not support loops with results";
+    diag.attachNote(target.getLoc()) << "target payload op";
+    return diag;
+  }
+  if (failed(checkTilePerfectlyNestedOrderedPreconditions(
+          nest, dimensions, tileSizes, pointDimensions))) {
+    auto diag = emitSilenceableError()
+                << "affine loop tiling requires a hyperrectangular iteration "
+                   "domain and representable tiled steps";
+    diag.attachNote(target.getLoc()) << "target payload op";
+    return diag;
+  }
+  if (!dimensions.empty()) {
+    bool hasUnmodeledMemoryEffects = false;
+    target.walk([&](Operation *nested) {
+      if (isa<AffineReadOpInterface, AffineWriteOpInterface>(nested) ||
+          isa<AffineForOp, AffineIfOp, AffineYieldOp>(nested) ||
+          isMemoryEffectFree(nested))
+        return;
+      hasUnmodeledMemoryEffects = true;
+    });
+    if (hasUnmodeledMemoryEffects) {
+      auto diag = emitSilenceableError()
+                  << "affine loop tiling cannot prove legality for non-affine "
+                     "memory operations";
+      diag.attachNote(target.getLoc()) << "target payload op";
+      return diag;
+    }
+    if (!isTilePerfectlyNestedOrderedValid(nest, dimensions, tileSizes,
+                                            pointDimensions)) {
+      auto diag = emitSilenceableError()
+                  << "affine loop nest is not legal to tile in the requested "
+                     "dimension order";
+      diag.attachNote(target.getLoc()) << "target payload op";
+      return diag;
+    }
+  }
+  SmallVector<AffineForOp> tiledNest;
+  if (failed(tilePerfectlyNestedOrdered(nest, dimensions, tileSizes,
+                                        pointDimensions, &tiledNest,
+                                        &rewriter)))
+    return emitDefiniteFailure() << "failed to tile prevalidated affine nest";
+  unsigned numTileLoops = dimensions.size();
+  results.set(cast<OpResult>(getTileLoops()),
+              ArrayRef(tiledNest).take_front(numTileLoops));
+  results.set(cast<OpResult>(getPointLoops()),
+              ArrayRef(tiledNest).drop_front(numTileLoops));
+  return DiagnosedSilenceableFailure::success();
+}
+
+void TileOp::getEffects(
+    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  consumesHandle(getTargetMutable(), effects);
+  producesHandle(getOperation()->getOpResults(), effects);
+  modifiesPayload(effects);
+}
+
+//===----------------------------------------------------------------------===//
+// AffineVectorizeOp
+//===----------------------------------------------------------------------===//
+
+DiagnosedSilenceableFailure AffineVectorizeOp::apply(
+    transform::TransformRewriter &rewriter, TransformResults &results,
+    TransformState &state) {
+  SmallVector<AffineForOp> roots;
+  DenseSet<Operation *> uniqueRoots;
+  for (Operation *payload : state.getPayloadOps(getTarget())) {
+    auto root = dyn_cast<AffineForOp>(payload);
+    if (!root)
+      return emitSilenceableError()
+             << "expected target payload operations to be affine.for";
+    if (!uniqueRoots.insert(payload).second)
+      return emitSilenceableError() << "duplicate affine point-band target";
+    roots.push_back(root);
+  }
+  if (roots.empty())
+    return emitSilenceableError() << "expected at least one affine point band";
+
+  for (auto [index, root] : llvm::enumerate(roots)) {
+    for (AffineForOp other : ArrayRef(roots).drop_front(index + 1)) {
+      if (!root->isAncestor(other) && !other->isAncestor(root))
+        continue;
+      auto diag = emitSilenceableError()
+                  << "affine vectorization targets must not overlap";
+      diag.attachNote(root.getLoc()) << "first overlapping point band";
+      diag.attachNote(other.getLoc()) << "second overlapping point band";
+      return diag;
+    }
+  }
+
+  SmallVector<AffineForOp> selectedLoops;
+  DenseSet<Operation *> uniqueSelectedLoops;
+  for (Operation *payload : state.getPayloadOps(getVectorizedLoops())) {
+    auto loop = dyn_cast<AffineForOp>(payload);
+    if (!loop)
+      return emitSilenceableError()
+             << "expected selected payload operations to be affine.for";
+    if (!uniqueSelectedLoops.insert(payload).second)
+      return emitSilenceableError() << "duplicate selected affine loop";
+    selectedLoops.push_back(loop);
+  }
+  if (selectedLoops.empty())
+    return emitSilenceableError()
+           << "expected at least one selected affine loop";
+
+  SmallVector<int64_t> vectorSizes;
+  if (getVectorSizes())
+    llvm::append_range(vectorSizes, *getVectorSizes());
+  if (llvm::any_of(vectorSizes, [](int64_t size) { return size <= 0; }))
+    return emitSilenceableError() << "expected positive vector sizes";
+
+  SmallVector<SmallVector<AffineForOp>> selectedByRoot(roots.size());
+  for (AffineForOp selected : selectedLoops) {
+    std::optional<unsigned> owner;
+    for (auto [rootIndex, root] : llvm::enumerate(roots)) {
+      if (root != selected && !root->isAncestor(selected))
+        continue;
+      if (owner)
+        return emitDefiniteFailure()
+               << "selected loop belongs to overlapping point bands";
+      owner = rootIndex;
+    }
+    if (!owner) {
+      auto diag = emitSilenceableError()
+                  << "selected affine loop does not belong to a targeted "
+                     "point band";
+      diag.attachNote(selected.getLoc()) << "selected loop";
+      return diag;
+    }
+    selectedByRoot[*owner].push_back(selected);
+  }
+
+  for (auto [root, selected] : llvm::zip_equal(roots, selectedByRoot)) {
+    if (selected.empty()) {
+      auto diag = emitSilenceableError()
+                  << "each targeted point band must contain a selected loop";
+      diag.attachNote(root.getLoc()) << "point band without selected loop";
+      return diag;
+    }
+    if (failed(checkVectorizeAffineLoopNestSelectedPreconditions(
+            root, selected, vectorSizes))) {
+      auto diag = emitSilenceableError()
+                  << "selected affine loops are not legal to vectorize";
+      diag.attachNote(root.getLoc()) << "target point band";
+      return diag;
+    }
+  }
+
+  for (auto [root, selected] : llvm::zip_equal(roots, selectedByRoot))
+    if (failed(vectorizeAffineLoopNestSelected(root, selected, vectorSizes,
+                                               &rewriter)))
+      return emitSilenceableError()
+             << "failed to vectorize prevalidated affine point band";
+  return DiagnosedSilenceableFailure::success();
+}
+
+void AffineVectorizeOp::getEffects(
+    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  onlyReadsHandle(getTargetMutable(), effects);
+  onlyReadsHandle(getVectorizedLoopsMutable(), effects);
+  modifiesPayload(effects);
+}
+
+//===----------------------------------------------------------------------===//
+// ParallelizeOp
+//===----------------------------------------------------------------------===//
+
+DiagnosedSilenceableFailure
+ParallelizeOp::apply(transform::TransformRewriter &rewriter,
+                     TransformResults &results, TransformState &state) {
+  SmallVector<AffineForOp> targets;
+  DenseSet<Operation *> uniqueTargets;
+  for (Operation *target : state.getPayloadOps(getTarget())) {
+    auto forOp = dyn_cast<AffineForOp>(target);
+    if (!forOp) {
+      auto diag = emitSilenceableError()
+                  << "expected target to be an affine.for operation";
+      diag.attachNote(target->getLoc()) << "target payload op";
+      return diag;
+    }
+    if (!uniqueTargets.insert(target).second) {
+      auto diag = emitSilenceableError() << "duplicate target operation";
+      diag.attachNote(target->getLoc()) << "duplicate target";
+      return diag;
+    }
+    if (forOp.getNumIterOperands() != 0) {
+      auto diag = emitSilenceableError()
+                  << "affine.for loops with iter arguments are not supported";
+      diag.attachNote(target->getLoc()) << "target payload op";
+      return diag;
+    }
+    if (!isLoopParallel(forOp)) {
+      auto diag = emitSilenceableError()
+                  << "could not prove that the affine.for loop is parallel";
+      diag.attachNote(target->getLoc()) << "target payload op";
+      return diag;
+    }
+    targets.push_back(forOp);
+  }
+
+  for (auto [index, target] : llvm::enumerate(targets)) {
+    for (AffineForOp other : ArrayRef(targets).drop_front(index + 1)) {
+      if (!target->isAncestor(other) && !other->isAncestor(target))
+        continue;
+      auto diag = emitSilenceableError() << "overlapping target operations";
+      diag.attachNote(target.getLoc()) << "first overlapping target";
+      diag.attachNote(other.getLoc()) << "second overlapping target";
+      return diag;
+    }
+  }
+
+  SmallVector<Operation *> parallelLoops;
+  parallelLoops.reserve(targets.size());
+  for (AffineForOp target : targets) {
+    AffineParallelOp parallel;
+    if (failed(affineParallelize(target, {}, &parallel, &rewriter)))
+      return emitDefiniteFailure() << "failed to parallelize affine.for loop";
+    parallelLoops.push_back(parallel);
+  }
+  results.set(cast<OpResult>(getParallel()), parallelLoops);
+  return DiagnosedSilenceableFailure::success();
+}
+
+void ParallelizeOp::getEffects(
+    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  consumesHandle(getTargetMutable(), effects);
+  producesHandle(getOperation()->getOpResults(), effects);
+  modifiesPayload(effects);
+}
 
 //===----------------------------------------------------------------------===//
 // SimplifyBoundedAffineOpsOp
@@ -150,6 +476,41 @@ void SimplifyBoundedAffineOpsOp::getEffects(
 }
 
 //===----------------------------------------------------------------------===//
+// SuperVectorizeOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult SuperVectorizeOp::verify() {
+  if (getFastestVaryingPattern().has_value()) {
+    if (getFastestVaryingPattern()->size() != getVectorSizes().size())
+      return emitOpError()
+             << "fastest varying pattern specified with different size than "
+                "the vector size";
+  }
+  return success();
+}
+
+DiagnosedSilenceableFailure
+SuperVectorizeOp::apply(transform::TransformRewriter &rewriter,
+                        TransformResults &results, TransformState &state) {
+  ArrayRef<int64_t> fastestVaryingPattern;
+  if (getFastestVaryingPattern().has_value())
+    fastestVaryingPattern = getFastestVaryingPattern().value();
+
+  for (Operation *target : state.getPayloadOps(getTarget()))
+    if (!target->getParentOfType<affine::AffineForOp>())
+      vectorizeChildAffineLoops(target, getVectorizeReductions(),
+                                getVectorSizes(), fastestVaryingPattern);
+
+  return DiagnosedSilenceableFailure::success();
+}
+
+void SuperVectorizeOp::getEffects(
+    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  consumesHandle(getTargetMutable(), effects);
+  modifiesPayload(effects);
+}
+
+//===----------------------------------------------------------------------===//
 // SimplifyMinMaxAffineOpsOp
 //===----------------------------------------------------------------------===//
 DiagnosedSilenceableFailure
@@ -200,6 +561,7 @@ public:
 
   void init() {
     declareGeneratedDialect<AffineDialect>();
+    declareGeneratedDialect<vector::VectorDialect>();
 
     registerTransformOps<
 #define GET_OP_LIST

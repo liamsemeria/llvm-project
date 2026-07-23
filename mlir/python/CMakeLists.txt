@@ -240,6 +240,15 @@ declare_mlir_python_sources(
 declare_mlir_dialect_extension_python_bindings(
   ADD_TO_PARENT MLIRPythonSources.Dialects
   ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/mlir"
+  TD_FILE dialects/AffineTransformOps.td
+  SOURCES
+    dialects/transform/affine.py
+  DIALECT_NAME transform
+  EXTENSION_NAME affine_transform)
+
+declare_mlir_dialect_extension_python_bindings(
+  ADD_TO_PARENT MLIRPythonSources.Dialects
+  ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/mlir"
   TD_FILE dialects/BufferizationTransformOps.td
   SOURCES
     dialects/transform/bufferization.py

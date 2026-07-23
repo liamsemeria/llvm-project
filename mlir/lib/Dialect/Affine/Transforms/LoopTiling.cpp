@@ -91,12 +91,13 @@ static void adjustToDivisorsOfTripCounts(ArrayRef<AffineForOp> band,
   assert(band.size() == tileSizes->size() && "invalid tile size count");
   for (unsigned i = 0, e = band.size(); i < e; i++) {
     unsigned &tSizeAdjusted = (*tileSizes)[i];
-    std::optional<uint64_t> mayConst = getConstantTripCount(band[i]);
+    AffineForOp forOp = band[i];
+    std::optional<APInt> mayConst = forOp.getStaticTripCount();
     if (!mayConst)
       continue;
     // Adjust the tile size to largest factor of the trip count less than
     // tSize.
-    uint64_t constTripCount = *mayConst;
+    uint64_t constTripCount = mayConst->getZExtValue();
     if (constTripCount > 1 && tSizeAdjusted > constTripCount / 2)
       tSizeAdjusted = constTripCount / 2;
     while (constTripCount % tSizeAdjusted != 0)
@@ -214,13 +215,29 @@ void LoopTiling::runOnOperation() {
 
     // Separate full and partial tiles.
     if (separate) {
-      auto intraTileLoops =
-          MutableArrayRef<AffineForOp>(tiledNest).drop_front(band.size());
-      if (failed(separateFullTiles(intraTileLoops))) {
-        assert(!intraTileLoops.empty() &&
-               "guaranteed to succeed on empty bands");
-        LLVM_DEBUG(intraTileLoops.front()->emitRemark(
-            "separation post tiling failed!"));
+      unsigned numTiledLoops = llvm::count_if(
+          tileSizes, [](unsigned tileSize) { return tileSize != 0; });
+      SmallVector<std::pair<unsigned, unsigned>> tiledBands;
+      for (unsigned i = 0; i < tileSizes.size();) {
+        while (i < tileSizes.size() && tileSizes[i] == 0)
+          ++i;
+        unsigned bandStart = i;
+        while (i < tileSizes.size() && tileSizes[i] != 0)
+          ++i;
+        if (bandStart != i)
+          tiledBands.emplace_back(bandStart, i);
+      }
+
+      // Separate inner bands first so cloned outer full tiles include any
+      // separation already introduced in their nested bands.
+      for (auto [bandStart, bandEnd] : llvm::reverse(tiledBands)) {
+        MutableArrayRef<AffineForOp> intraTileLoops(tiledNest);
+        intraTileLoops = intraTileLoops.slice(numTiledLoops + bandStart,
+                                              bandEnd - bandStart);
+        if (failed(separateFullTiles(intraTileLoops))) {
+          LLVM_DEBUG(intraTileLoops.front()->emitRemark(
+              "separation post tiling failed!"));
+        }
       }
     }
   }

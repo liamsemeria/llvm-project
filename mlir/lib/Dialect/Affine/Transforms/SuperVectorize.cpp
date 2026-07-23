@@ -18,6 +18,7 @@
 #include "mlir/Dialect/Affine/Analysis/LoopAnalysis.h"
 #include "mlir/Dialect/Affine/Analysis/NestedMatcher.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Affine/LoopUtils.h"
 #include "mlir/Dialect/Affine/Utils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -27,6 +28,7 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Support/LLVM.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/CheckedArithmetic.h"
 #include "llvm/Support/Debug.h"
 #include <optional>
 
@@ -515,7 +517,7 @@ using namespace vector;
 /// Comparing to the non-vector-dimension case, two additional things are done
 /// during vectorization of such loops:
 /// - The resulting vector returned from the loop is reduced to a scalar using
-///   `vector.reduce`.
+///   `vector.reduction`.
 /// - In some cases a mask is applied to the vector yielded at the end of the
 ///   loop to prevent garbage values from being written to the accumulator.
 ///
@@ -675,7 +677,8 @@ namespace {
 
 struct VectorizationState {
 
-  VectorizationState(MLIRContext *context) : builder(context) {}
+  VectorizationState(OpBuilder &builder, RewriterBase *rewriter)
+      : builder(builder), rewriter(rewriter) {}
 
   /// Registers the vector replacement of a scalar operation and its result
   /// values. Both operations must have the same number of results.
@@ -743,7 +746,8 @@ struct VectorizationState {
 
   // Used to build and insert all the new operations created. The insertion
   // point is preserved and updated along the vectorization process.
-  OpBuilder builder;
+  OpBuilder &builder;
+  RewriterBase *rewriter;
 
   // Maps input scalar operations to their vector counterparts.
   DenseMap<Operation *, Operation *> opVectorReplacement;
@@ -886,15 +890,18 @@ void VectorizationState::getScalarValueReplacementsFor(
 }
 
 /// Erases a loop nest, including all its nested operations.
-static void eraseLoopNest(AffineForOp forOp) {
+static void eraseLoopNest(AffineForOp forOp, RewriterBase *rewriter = nullptr) {
   LLVM_DEBUG(dbgs() << "[early-vect]+++++ erasing:\n" << forOp << "\n");
-  forOp.erase();
+  if (rewriter)
+    rewriter->eraseOp(forOp);
+  else
+    forOp.erase();
 }
 
 /// Erases the scalar loop nest after its successful vectorization.
 void VectorizationState::finishVectorizationPattern(AffineForOp rootLoop) {
   LLVM_DEBUG(dbgs() << "\n[early-vect] Finalizing vectorization\n");
-  eraseLoopNest(rootLoop);
+  eraseLoopNest(rootLoop, rewriter);
 }
 
 // Apply 'map' with 'mapOperands' returning resulting values in 'results'.
@@ -965,6 +972,19 @@ static arith::ConstantOp vectorizeConstant(arith::ConstantOp constOp,
 
   // Register vector replacement for future uses in the scope.
   state.registerOpVectorReplacement(constOp, newConstOp);
+
+  // Index-typed constants are also used as scalar indices in vectorized memory
+  // operations (e.g., as operands to vector.transfer_read/write). Register a
+  // scalar replacement so that getScalarValueReplacementsFor can find a live
+  // value in the vectorized loop body instead of falling back to the original
+  // constant, which will be erased along with the scalar loop.
+  if (isa<IndexType>(scalarTy)) {
+    auto scalarConstOp = arith::ConstantOp::create(
+        state.builder, constOp.getLoc(), constOp.getValue());
+    state.registerValueScalarReplacement(constOp.getResult(),
+                                         scalarConstOp.getResult());
+  }
+
   return newConstOp;
 }
 
@@ -1073,8 +1093,12 @@ static Value createMask(AffineForOp vecForOp, VectorizationState &state) {
       makeComposedAffineApply(state.builder, loc, AffineMap::get(2, 0, subExpr),
                               {ub, vecForOp.getInductionVar()});
   // If the affine maps were successfully composed then `ub` is unneeded.
-  if (ub.use_empty())
-    ub.getDefiningOp()->erase();
+  if (ub.use_empty()) {
+    if (state.rewriter)
+      state.rewriter->eraseOp(ub.getDefiningOp());
+    else
+      ub.getDefiningOp()->erase();
+  }
   // Finally we create the mask.
   Type maskTy = VectorType::get(state.strategy->vectorSizes,
                                 state.builder.getIntegerType(1));
@@ -1252,9 +1276,11 @@ static Operation *vectorizeAffineLoad(AffineLoadOp loadOp,
   LLVM_DEBUG(dbgs() << "\n[early-vect]+++++ permutationMap: ");
   LLVM_DEBUG(permutationMap.print(dbgs()));
 
-  auto transfer = vector::TransferReadOp::create(
-      state.builder, loadOp.getLoc(), vectorType, loadOp.getMemRef(), indices,
-      /*padding=*/std::nullopt, permutationMap);
+  Value transferVal = createReadOrMaskedRead(
+      state.builder, loadOp.getLoc(), loadOp.getMemRef(), vectorType,
+      /*padValue=*/std::nullopt, /*useInBoundsInsteadOfMasking=*/true, indices,
+      permutationMap);
+  Operation *transfer = transferVal.getDefiningOp();
 
   // Register replacement for future uses in the scope.
   state.registerOpVectorReplacement(loadOp, transfer);
@@ -1299,10 +1325,20 @@ static Operation *vectorizeAffineStore(AffineStoreOp storeOp,
   LLVM_DEBUG(dbgs() << "\n[early-vect]+++++ permutationMap: ");
   LLVM_DEBUG(permutationMap.print(dbgs()));
 
-  auto transfer = vector::TransferWriteOp::create(
+  // A transfer_write with a broadcast dimension (constant expr in the
+  // permutation map) is invalid. Bail out to avoid producing invalid IR.
+  if (llvm::any_of(permutationMap.getResults(),
+                   llvm::IsaPred<AffineConstantExpr>)) {
+    LLVM_DEBUG(dbgs() << "\n[early-vect]+++++ store permutation map has "
+                         "broadcast dims, bailing out\n");
+    return nullptr;
+  }
+
+  Operation *transfer = createWriteOrMaskedWrite(
       state.builder, storeOp.getLoc(), vectorValue, storeOp.getMemRef(),
-      indices, permutationMap);
-  LLVM_DEBUG(dbgs() << "\n[early-vect]+++++ vectorized store: " << transfer);
+      SmallVector<Value>(indices.begin(), indices.end()),
+      /*useInBoundsInsteadOfMasking=*/true, permutationMap);
+  LLVM_DEBUG(dbgs() << "\n[early-vect]+++++ vectorized store: " << *transfer);
 
   // Register replacement for future uses in the scope.
   state.registerOpVectorReplacement(storeOp, transfer);
@@ -1347,12 +1383,16 @@ static Operation *vectorizeAffineForOp(AffineForOp forOp,
   // If we are vectorizing a vector dimension, compute a new step for the new
   // vectorized loop using the vectorization factor for the vector dimension.
   // Otherwise, propagate the step of the scalar loop.
-  unsigned newStep;
+  uint64_t newStep;
   if (isLoopVecDim) {
     unsigned vectorDim = loopToVecDimIt->second;
     assert(vectorDim < strategy.vectorSizes.size() && "vector dim overflow");
     int64_t forOpVecFactor = strategy.vectorSizes[vectorDim];
-    newStep = forOp.getStepAsInt() * forOpVecFactor;
+    std::optional<int64_t> product =
+        llvm::checkedMul<int64_t>(forOp.getStepAsInt(), forOpVecFactor);
+    if (!product || *product <= 0)
+      return nullptr;
+    newStep = *product;
   } else {
     newStep = forOp.getStepAsInt();
   }
@@ -1383,10 +1423,17 @@ static Operation *vectorizeAffineForOp(AffineForOp forOp,
     }
   }
 
+  // Replace bound operands with their scalar replacements. This is required
+  // when the bounds reference an outer loop's induction variable, which will
+  // be replaced (and eventually erased) once the scalar loop nest is removed.
+  SmallVector<Value, 8> lbOperands, ubOperands;
+  state.getScalarValueReplacementsFor(forOp.getLowerBoundOperands(),
+                                      lbOperands);
+  state.getScalarValueReplacementsFor(forOp.getUpperBoundOperands(),
+                                      ubOperands);
   auto vecForOp = AffineForOp::create(
-      state.builder, forOp.getLoc(), forOp.getLowerBoundOperands(),
-      forOp.getLowerBoundMap(), forOp.getUpperBoundOperands(),
-      forOp.getUpperBoundMap(), newStep, vecIterOperands,
+      state.builder, forOp.getLoc(), lbOperands, forOp.getLowerBoundMap(),
+      ubOperands, forOp.getUpperBoundMap(), newStep, vecIterOperands,
       /*bodyBuilder=*/[](OpBuilder &, Location, Value, ValueRange) {
         // Make sure we don't create a default terminator in the loop body as
         // the proper terminator will be added during vectorization.
@@ -1593,10 +1640,21 @@ getMatchedAffineLoops(NestedMatch match,
 /// using an n-D vectorization strategy.
 static LogicalResult
 vectorizeLoopNest(std::vector<SmallVector<AffineForOp, 2>> &loops,
-                  const VectorizationStrategy &strategy) {
+                  const VectorizationStrategy &strategy,
+                  AffineForOp *vectorizedRoot = nullptr,
+                  RewriterBase *rewriter = nullptr) {
   assert(loops[0].size() == 1 && "Expected single root loop");
   AffineForOp rootLoop = loops[0][0];
-  VectorizationState state(rootLoop.getContext());
+  Operation *cleanupScope = rootLoop;
+  while (cleanupScope->getParentOp() &&
+         !cleanupScope->hasTrait<OpTrait::IsIsolatedFromAbove>())
+    cleanupScope = cleanupScope->getParentOp();
+  DenseSet<Operation *> existingOperations;
+  cleanupScope->walk([&](Operation *op) { existingOperations.insert(op); });
+  OpBuilder defaultBuilder(rootLoop.getContext());
+  OpBuilder &builder =
+      rewriter ? static_cast<OpBuilder &>(*rewriter) : defaultBuilder;
+  VectorizationState state(builder, rewriter);
   state.builder.setInsertionPointAfter(rootLoop);
   state.strategy = &strategy;
 
@@ -1636,18 +1694,31 @@ vectorizeLoopNest(std::vector<SmallVector<AffineForOp, 2>> &loops,
   if (opVecResult.wasInterrupted()) {
     LLVM_DEBUG(dbgs() << "[early-vect]+++++ failed vectorization for: "
                       << rootLoop << "\n");
-    // Erase vector loop nest if it was created.
-    auto vecRootLoopIt = state.opVectorReplacement.find(rootLoop);
-    if (vecRootLoopIt != state.opVectorReplacement.end())
-      eraseLoopNest(cast<AffineForOp>(vecRootLoopIt->second));
+    // Erase all newly created operation trees, including helper operations that
+    // may have been inserted outside of the replacement loop nest.
+    SmallVector<Operation *> newOperationRoots;
+    cleanupScope->walk<WalkOrder::PreOrder>([&](Operation *op) {
+      if (!existingOperations.contains(op) &&
+          existingOperations.contains(op->getParentOp()))
+        newOperationRoots.push_back(op);
+    });
+    for (Operation *op : llvm::reverse(newOperationRoots)) {
+      if (rewriter)
+        rewriter->eraseOp(op);
+      else
+        op->erase();
+    }
 
     return failure();
   }
 
   // Replace results of reduction loops with the scalar values computed using
-  // `vector.reduce` or similar ops.
+  // `vector.reduction` or similar ops.
   for (auto resPair : state.loopResultScalarReplacement)
-    resPair.first.replaceAllUsesWith(resPair.second);
+    if (rewriter)
+      rewriter->replaceAllUsesWith(resPair.first, resPair.second);
+    else
+      resPair.first.replaceAllUsesWith(resPair.second);
 
   assert(state.opVectorReplacement.count(rootLoop) == 1 &&
          "Expected vector replacement for loop nest");
@@ -1656,7 +1727,11 @@ vectorizeLoopNest(std::vector<SmallVector<AffineForOp, 2>> &loops,
                     << *state.opVectorReplacement[rootLoop]);
 
   // Finish this vectorization pattern.
+  AffineForOp replacement =
+      cast<AffineForOp>(state.opVectorReplacement[rootLoop]);
   state.finishVectorizationPattern(rootLoop);
+  if (vectorizedRoot)
+    *vectorizedRoot = replacement;
   return success();
 }
 
@@ -1774,6 +1849,37 @@ static void vectorizeLoops(Operation *parentOp, DenseSet<Operation *> &loops,
   LLVM_DEBUG(dbgs() << "\n");
 }
 
+void affine::vectorizeChildAffineLoops(
+    Operation *parentOp, bool vectorizeReductions,
+    ArrayRef<int64_t> vectorSizes, ArrayRef<int64_t> fastestVaryingPattern) {
+  DenseSet<Operation *> parallelLoops;
+  ReductionLoopMap reductionLoops;
+
+  // If 'vectorize-reduction=true' is provided, we also populate the
+  // `reductionLoops` map.
+  if (vectorizeReductions) {
+    parentOp->walk([&parallelLoops, &reductionLoops](AffineForOp loop) {
+      SmallVector<LoopReduction, 2> reductions;
+      if (isLoopParallel(loop, &reductions)) {
+        parallelLoops.insert(loop);
+        // If it's not a reduction loop, adding it to the map is not necessary.
+        if (!reductions.empty())
+          reductionLoops[loop] = reductions;
+      }
+    });
+  } else {
+    parentOp->walk([&parallelLoops](AffineForOp loop) {
+      if (isLoopParallel(loop))
+        parallelLoops.insert(loop);
+    });
+  }
+
+  // Thread-safe RAII local context, BumpPtrAllocator freed on exit.
+  NestedPatternContext mlContext;
+  vectorizeLoops(parentOp, parallelLoops, vectorSizes, fastestVaryingPattern,
+                 reductionLoops);
+}
+
 /// Applies vectorization to the current function by searching over a bunch of
 /// predetermined patterns.
 void Vectorize::runOnOperation() {
@@ -1795,32 +1901,8 @@ void Vectorize::runOnOperation() {
     return signalPassFailure();
   }
 
-  DenseSet<Operation *> parallelLoops;
-  ReductionLoopMap reductionLoops;
-
-  // If 'vectorize-reduction=true' is provided, we also populate the
-  // `reductionLoops` map.
-  if (vectorizeReductions) {
-    f.walk([&parallelLoops, &reductionLoops](AffineForOp loop) {
-      SmallVector<LoopReduction, 2> reductions;
-      if (isLoopParallel(loop, &reductions)) {
-        parallelLoops.insert(loop);
-        // If it's not a reduction loop, adding it to the map is not necessary.
-        if (!reductions.empty())
-          reductionLoops[loop] = reductions;
-      }
-    });
-  } else {
-    f.walk([&parallelLoops](AffineForOp loop) {
-      if (isLoopParallel(loop))
-        parallelLoops.insert(loop);
-    });
-  }
-
-  // Thread-safe RAII local context, BumpPtrAllocator freed on exit.
-  NestedPatternContext mlContext;
-  vectorizeLoops(f, parallelLoops, vectorSizes, fastestVaryingPattern,
-                 reductionLoops);
+  vectorizeChildAffineLoops(f, vectorizeReductions, vectorSizes,
+                            fastestVaryingPattern);
 }
 
 /// Verify that affine loops in 'loops' meet the nesting criteria expected by
@@ -1916,10 +1998,124 @@ void mlir::affine::vectorizeAffineLoops(
 /// loops = {{%i1}}, to vectorize only the middle loop.
 LogicalResult mlir::affine::vectorizeAffineLoopNest(
     std::vector<SmallVector<AffineForOp, 2>> &loops,
-    const VectorizationStrategy &strategy) {
+    const VectorizationStrategy &strategy, AffineForOp *vectorizedRoot,
+    RewriterBase *rewriter) {
   // Thread-safe RAII local context, BumpPtrAllocator freed on exit.
   NestedPatternContext mlContext;
   if (failed(verifyLoopNesting(loops)))
     return failure();
-  return vectorizeLoopNest(loops, strategy);
+  return vectorizeLoopNest(loops, strategy, vectorizedRoot, rewriter);
+}
+
+static LogicalResult validateSelectedVectorization(
+    AffineForOp root, ArrayRef<AffineForOp> selectedLoops,
+    ArrayRef<int64_t> inputVectorSizes,
+    SmallVectorImpl<int64_t> *validatedVectorSizes = nullptr,
+    SmallVectorImpl<AffineForOp> *validatedNest = nullptr) {
+  if (selectedLoops.empty())
+    return failure();
+
+  SmallVector<AffineForOp> perfectNest;
+  getPerfectlyNestedLoops(perfectNest, root);
+  if (perfectNest.empty())
+    return failure();
+
+  DenseMap<Operation *, unsigned> nestPositions;
+  for (auto [position, loop] : llvm::enumerate(perfectNest))
+    nestPositions[loop] = position;
+
+  unsigned previousPosition = 0;
+  SmallVector<int64_t> vectorSizes;
+  vectorSizes.reserve(selectedLoops.size());
+  for (auto [selectedPosition, selectedLoop] :
+       llvm::enumerate(selectedLoops)) {
+    AffineForOp loop = selectedLoop;
+    auto position = nestPositions.find(loop);
+    if (position == nestPositions.end() ||
+        (selectedPosition != 0 && position->second <= previousPosition) ||
+        loop.getStep() != 1)
+      return failure();
+    previousPosition = position->second;
+
+    std::optional<APInt> tripCount = loop.getStaticTripCount();
+    if (!tripCount || !tripCount->isStrictlyPositive() ||
+        tripCount->getActiveBits() > 63)
+      return failure();
+    int64_t inferredSize = tripCount->getSExtValue();
+    vectorSizes.push_back(inferredSize);
+
+    SmallVector<LoopReduction, 2> reductions;
+    if (!isLoopParallel(loop, &reductions) || !reductions.empty())
+      return failure();
+  }
+
+  if (!inputVectorSizes.empty()) {
+    if (inputVectorSizes.size() != selectedLoops.size())
+      return failure();
+    for (auto [inputSize, inferredSize] :
+         llvm::zip_equal(inputVectorSizes, vectorSizes))
+      if (inputSize <= 0 || inputSize != inferredSize)
+        return failure();
+    vectorSizes.assign(inputVectorSizes.begin(), inputVectorSizes.end());
+  }
+
+  if (validatedVectorSizes)
+    validatedVectorSizes->assign(vectorSizes.begin(), vectorSizes.end());
+  if (validatedNest)
+    validatedNest->assign(perfectNest.begin(), perfectNest.end());
+  return success();
+}
+
+LogicalResult mlir::affine::checkVectorizeAffineLoopNestSelectedPreconditions(
+    AffineForOp root, ArrayRef<AffineForOp> selectedLoops,
+    ArrayRef<int64_t> inputVectorSizes) {
+  return validateSelectedVectorization(root, selectedLoops, inputVectorSizes);
+}
+
+LogicalResult mlir::affine::vectorizeAffineLoopNestSelected(
+    AffineForOp root, ArrayRef<AffineForOp> selectedLoops,
+    ArrayRef<int64_t> inputVectorSizes, RewriterBase *rewriter) {
+  SmallVector<int64_t> vectorSizes;
+  SmallVector<AffineForOp> perfectNest;
+  if (failed(validateSelectedVectorization(root, selectedLoops,
+                                           inputVectorSizes, &vectorSizes,
+                                           &perfectNest)))
+    return failure();
+
+  DenseMap<Operation *, unsigned> nestPositions;
+  for (auto [position, loop] : llvm::enumerate(perfectNest))
+    nestPositions[loop] = position;
+  unsigned outermostSelectedPosition = nestPositions[selectedLoops.front()];
+  SmallVector<AffineForOp> scalarAncestors(
+      perfectNest.begin(), perfectNest.begin() + outermostSelectedPosition);
+
+  VectorizationStrategy strategy;
+  strategy.vectorSizes.assign(vectorSizes.begin(), vectorSizes.end());
+  std::vector<SmallVector<AffineForOp, 2>> loopsToVectorize;
+  loopsToVectorize.reserve(selectedLoops.size());
+  for (auto [vectorDimension, loop] : llvm::enumerate(selectedLoops)) {
+    strategy.loopToVectorDim[loop] = vectorDimension;
+    loopsToVectorize.push_back({loop});
+  }
+
+  AffineForOp vectorizedRoot;
+  if (failed(vectorizeAffineLoopNest(loopsToVectorize, strategy,
+                                     &vectorizedRoot, rewriter)))
+    return failure();
+
+  SmallVector<AffineForOp> vectorizedNest;
+  getPerfectlyNestedLoops(vectorizedNest, vectorizedRoot);
+  for (AffineForOp loop : llvm::reverse(vectorizedNest)) {
+    std::optional<APInt> tripCount = loop.getStaticTripCount();
+    if (tripCount && *tripCount == 1)
+      if (failed(promoteIfSingleIteration(loop, rewriter)))
+        return failure();
+  }
+  for (AffineForOp loop : llvm::reverse(scalarAncestors)) {
+    std::optional<APInt> tripCount = loop.getStaticTripCount();
+    if (tripCount && *tripCount == 1)
+      if (failed(promoteIfSingleIteration(loop, rewriter)))
+        return failure();
+  }
+  return success();
 }

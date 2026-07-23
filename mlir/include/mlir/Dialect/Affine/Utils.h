@@ -24,6 +24,7 @@ class DominanceInfo;
 class Operation;
 class PostDominanceInfo;
 class ImplicitLocOpBuilder;
+class RewriterBase;
 
 namespace func {
 class FuncOp;
@@ -51,7 +52,8 @@ using ReductionLoopMap = DenseMap<Operation *, SmallVector<LoopReduction, 2>>;
 /// newly created affine.parallel op.
 LogicalResult affineParallelize(AffineForOp forOp,
                                 ArrayRef<LoopReduction> parallelReductions = {},
-                                AffineParallelOp *resOp = nullptr);
+                                AffineParallelOp *resOp = nullptr,
+                                RewriterBase *rewriter = nullptr);
 
 /// Hoists out affine.if/else to as high as possible, i.e., past all invariant
 /// affine.fors/parallel's. Returns success if any hoisting happened; folded` is
@@ -102,6 +104,11 @@ struct VectorizationStrategy {
   // reduction descriptors.
   ReductionLoopMap reductionLoops;
 };
+
+/// Vectorize affine loops that are children of parentOp (including itself)
+void vectorizeChildAffineLoops(Operation *parentOp, bool vectorizeReductions,
+                               ArrayRef<int64_t> vectorSizes,
+                               ArrayRef<int64_t> fastestVaryingPattern);
 
 /// Replace affine store and load accesses by scalars by forwarding stores to
 /// loads and eliminate invariant affine loads; consequently, eliminate dead
@@ -160,7 +167,21 @@ void vectorizeAffineLoops(
 /// loops = {{%i1}}, to vectorize only the middle loop.
 LogicalResult
 vectorizeAffineLoopNest(std::vector<SmallVector<AffineForOp, 2>> &loops,
-                        const VectorizationStrategy &strategy);
+                        const VectorizationStrategy &strategy,
+                        AffineForOp *vectorizedRoot = nullptr,
+                        RewriterBase *rewriter = nullptr);
+
+/// Vectorize only `selectedLoops` in the perfect nest rooted at `root`.
+/// Unselected loops remain scalar. Vector sizes are inferred from selected
+/// static trip counts when omitted and otherwise must equal those trip counts.
+LogicalResult checkVectorizeAffineLoopNestSelectedPreconditions(
+    AffineForOp root, ArrayRef<AffineForOp> selectedLoops,
+    ArrayRef<int64_t> inputVectorSizes = {});
+
+LogicalResult vectorizeAffineLoopNestSelected(
+    AffineForOp root, ArrayRef<AffineForOp> selectedLoops,
+    ArrayRef<int64_t> inputVectorSizes = {},
+    RewriterBase *rewriter = nullptr);
 
 /// Normalize a affine.parallel op so that lower bounds are 0 and steps are 1.
 /// As currently implemented, this transformation cannot fail and will return

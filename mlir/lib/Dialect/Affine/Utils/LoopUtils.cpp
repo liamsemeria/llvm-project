@@ -12,6 +12,7 @@
 
 #include "mlir/Dialect/Affine/LoopUtils.h"
 #include "mlir/Analysis/SliceAnalysis.h"
+#include "mlir/Dialect/Affine/Analysis/AffineAnalysis.h"
 #include "mlir/Dialect/Affine/Analysis/LoopAnalysis.h"
 #include "mlir/Dialect/Affine/Analysis/Utils.h"
 #include "mlir/Dialect/Affine/IR/AffineValueMap.h"
@@ -23,7 +24,10 @@
 #include "mlir/IR/IntegerSet.h"
 #include "mlir/IR/OperationSupport.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "mlir/Transforms/RegionUtils.h"
 #include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/SetVector.h"
+#include "llvm/Support/CheckedArithmetic.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/DebugLog.h"
 #include "llvm/Support/raw_ostream.h"
@@ -100,24 +104,39 @@ getCleanupLoopLowerBound(AffineForOp forOp, unsigned unrollFactor,
 
 /// Helper to replace uses of loop carried values (iter_args) and loop
 /// yield values while promoting single iteration affine.for ops.
-static void replaceIterArgsAndYieldResults(AffineForOp forOp) {
+static void replaceIterArgsAndYieldResults(AffineForOp forOp,
+                                           RewriterBase *rewriter) {
   // Replace uses of iter arguments with iter operands (initial values).
   auto iterOperands = forOp.getInits();
   auto iterArgs = forOp.getRegionIterArgs();
-  for (auto e : llvm::zip(iterOperands, iterArgs))
-    std::get<1>(e).replaceAllUsesWith(std::get<0>(e));
+  for (auto e : llvm::zip(iterOperands, iterArgs)) {
+    if (rewriter)
+      rewriter->replaceAllUsesWith(std::get<1>(e), std::get<0>(e));
+    else
+      std::get<1>(e).replaceAllUsesWith(std::get<0>(e));
+  }
 
   // Replace uses of loop results with the values yielded by the loop.
   auto outerResults = forOp.getResults();
   auto innerResults = forOp.getBody()->getTerminator()->getOperands();
-  for (auto e : llvm::zip(outerResults, innerResults))
-    std::get<0>(e).replaceAllUsesWith(std::get<1>(e));
+  for (auto e : llvm::zip(outerResults, innerResults)) {
+    if (rewriter)
+      rewriter->replaceAllUsesWith(std::get<0>(e), std::get<1>(e));
+    else
+      std::get<0>(e).replaceAllUsesWith(std::get<1>(e));
+  }
 }
 
 /// Promotes the loop body of a forOp to its containing block if the forOp
 /// was known to have a single iteration.
-LogicalResult mlir::affine::promoteIfSingleIteration(AffineForOp forOp) {
-  std::optional<uint64_t> tripCount = getConstantTripCount(forOp);
+LogicalResult mlir::affine::promoteIfSingleIteration(AffineForOp forOp,
+                                                     RewriterBase *rewriter) {
+  OpBuilder defaultBuilder(forOp->getContext());
+  OpBuilder &builder =
+      rewriter ? static_cast<OpBuilder &>(*rewriter) : defaultBuilder;
+  OpBuilder::InsertionGuard guard(builder);
+
+  std::optional<APInt> tripCount = forOp.getStaticTripCount();
   if (!tripCount || *tripCount != 1)
     return failure();
 
@@ -131,37 +150,52 @@ LogicalResult mlir::affine::promoteIfSingleIteration(AffineForOp forOp) {
   if (!iv.use_empty()) {
     if (forOp.hasConstantLowerBound()) {
       auto func = forOp->getParentOfType<FunctionOpInterface>();
-      OpBuilder builder(forOp->getContext());
       if (func)
         builder.setInsertionPointToStart(&func.getFunctionBody().front());
       else
         builder.setInsertionPoint(forOp);
       auto constOp = arith::ConstantIndexOp::create(
           builder, forOp.getLoc(), forOp.getConstantLowerBound());
-      iv.replaceAllUsesWith(constOp);
+      if (rewriter)
+        rewriter->replaceAllUsesWith(iv, constOp);
+      else
+        iv.replaceAllUsesWith(constOp);
     } else {
       auto lbOperands = forOp.getLowerBoundOperands();
       auto lbMap = forOp.getLowerBoundMap();
-      OpBuilder builder(forOp);
+      builder.setInsertionPoint(forOp);
       if (lbMap == builder.getDimIdentityMap()) {
         // No need of generating an affine.apply.
-        iv.replaceAllUsesWith(lbOperands[0]);
+        if (rewriter)
+          rewriter->replaceAllUsesWith(iv, lbOperands[0]);
+        else
+          iv.replaceAllUsesWith(lbOperands[0]);
       } else {
         auto affineApplyOp =
             AffineApplyOp::create(builder, forOp.getLoc(), lbMap, lbOperands);
-        iv.replaceAllUsesWith(affineApplyOp);
+        if (rewriter)
+          rewriter->replaceAllUsesWith(iv, affineApplyOp);
+        else
+          iv.replaceAllUsesWith(affineApplyOp);
       }
     }
   }
 
-  replaceIterArgsAndYieldResults(forOp);
+  replaceIterArgsAndYieldResults(forOp, rewriter);
 
   // Move the loop body operations, except for its terminator, to the loop's
   // containing block.
-  forOp.getBody()->back().erase();
-  parentBlock->getOperations().splice(Block::iterator(forOp),
-                                      forOp.getBody()->getOperations());
-  forOp.erase();
+  if (rewriter) {
+    rewriter->eraseOp(forOp.getBody()->getTerminator());
+    for (Operation &op : llvm::make_early_inc_range(*forOp.getBody()))
+      rewriter->moveOpBefore(&op, forOp);
+    rewriter->eraseOp(forOp);
+  } else {
+    forOp.getBody()->back().erase();
+    parentBlock->getOperations().splice(Block::iterator(forOp),
+                                        forOp.getBody()->getOperations());
+    forOp.erase();
+  }
   return success();
 }
 
@@ -239,12 +273,12 @@ LogicalResult mlir::affine::affineForOpBodySkew(AffineForOp forOp,
   // conditional guards (or context information to prevent such versioning). The
   // better way to pipeline for such loops is to first tile them and extract
   // constant trip count "full tiles" before applying this.
-  auto mayBeConstTripCount = getConstantTripCount(forOp);
+  auto mayBeConstTripCount = forOp.getStaticTripCount();
   if (!mayBeConstTripCount) {
     LLVM_DEBUG(forOp.emitRemark("non-constant trip count loop not handled"));
     return success();
   }
-  uint64_t tripCount = *mayBeConstTripCount;
+  uint64_t tripCount = mayBeConstTripCount->getZExtValue();
 
   assert(isOpwiseShiftValid(forOp, shifts) &&
          "shifts will lead to an invalid transformation\n");
@@ -359,8 +393,7 @@ LogicalResult mlir::affine::affineForOpBodySkew(AffineForOp forOp,
 }
 
 /// Checks whether a loop nest is hyper-rectangular or not.
-static LogicalResult
-checkIfHyperRectangular(MutableArrayRef<AffineForOp> input) {
+static LogicalResult checkIfHyperRectangular(ArrayRef<AffineForOp> input) {
   FlatAffineValueConstraints cst;
   SmallVector<Operation *, 8> ops(input.begin(), input.end());
   // 0-d or 1-d is trivially hyper-rectangular.
@@ -380,9 +413,10 @@ checkIfHyperRectangular(MutableArrayRef<AffineForOp> input) {
 /// Check if the input nest is supported for tiling and whether tiling would be
 /// legal or not.
 template <typename t>
-static LogicalResult performPreTilingChecks(MutableArrayRef<AffineForOp> input,
+static LogicalResult performPreTilingChecks(ArrayRef<AffineForOp> input,
                                             ArrayRef<t> tileSizes) {
-  assert(input.size() == tileSizes.size() && "Too few/many tile sizes");
+  if (input.size() != tileSizes.size())
+    return failure();
 
   if (llvm::any_of(input,
                    [](AffineForOp op) { return op.getNumResults() > 0; })) {
@@ -421,42 +455,73 @@ static void moveLoopBody(AffineForOp src, AffineForOp dest) {
 /// Constructs tiled loop nest, without setting the loop bounds and move the
 /// body of the original loop nest to the tiled loop nest.
 static void constructTiledLoopNest(MutableArrayRef<AffineForOp> origLoops,
-                                   AffineForOp rootAffineForOp, unsigned width,
-                                   MutableArrayRef<AffineForOp> tiledLoops) {
+                                   AffineForOp rootAffineForOp,
+                                   ArrayRef<unsigned> tileSizes,
+                                   MutableArrayRef<AffineForOp> tiledLoops,
+                                   RewriterBase *rewriter) {
   Location loc = rootAffineForOp.getLoc();
+  unsigned width = origLoops.size();
+  unsigned numTiledLoops = tiledLoops.size() - width;
 
-  // The outermost among the loops as we add more..
-  Operation *topLoop = rootAffineForOp.getOperation();
-  AffineForOp innermostPointLoop;
-
-  // Add intra-tile (or point) loops.
-  for (unsigned i = 0; i < width; i++) {
-    OpBuilder b(topLoop);
-    // Loop bounds will be set later.
-    AffineForOp pointLoop = AffineForOp::create(b, loc, 0, 0);
-    pointLoop.getBody()->getOperations().splice(
-        pointLoop.getBody()->begin(), topLoop->getBlock()->getOperations(),
-        topLoop);
-    tiledLoops[2 * width - 1 - i] = pointLoop;
-    topLoop = pointLoop.getOperation();
-    if (i == 0)
-      innermostPointLoop = pointLoop;
+  // Describe the resulting nesting order. Consecutive tiled dimensions form
+  // a tiled band (all tile-space loops followed by all intra-tile loops), while
+  // zero-sized dimensions retain their original loop and split adjacent bands.
+  SmallVector<std::pair<bool, unsigned>> loopOrder;
+  for (unsigned i = 0; i < width;) {
+    if (tileSizes[i] == 0) {
+      loopOrder.emplace_back(/*isTileSpace=*/false, i++);
+      continue;
+    }
+    unsigned bandEnd = i;
+    while (bandEnd < width && tileSizes[bandEnd] != 0)
+      ++bandEnd;
+    for (unsigned dim = i; dim < bandEnd; ++dim)
+      loopOrder.emplace_back(/*isTileSpace=*/true, dim);
+    for (unsigned dim = i; dim < bandEnd; ++dim)
+      loopOrder.emplace_back(/*isTileSpace=*/false, dim);
+    i = bandEnd;
   }
 
-  // Add tile space loops;
-  for (unsigned i = width; i < 2 * width; i++) {
+  SmallVector<unsigned> tileLoopIndices(width, 0);
+  unsigned nextTileLoop = 0;
+  for (unsigned i = 0; i < width; ++i)
+    if (tileSizes[i] != 0)
+      tileLoopIndices[i] = nextTileLoop++;
+
+  // Wrap the original loop nest from innermost to outermost.
+  Operation *topLoop = rootAffineForOp.getOperation();
+  AffineForOp innermostPointLoop;
+  for (auto [isTileSpace, dim] : llvm::reverse(loopOrder)) {
     OpBuilder b(topLoop);
-    // Loop bounds will be set later.
-    AffineForOp tileSpaceLoop = AffineForOp::create(b, loc, 0, 0);
-    tileSpaceLoop.getBody()->getOperations().splice(
-        tileSpaceLoop.getBody()->begin(), topLoop->getBlock()->getOperations(),
-        topLoop);
-    tiledLoops[2 * width - i - 1] = tileSpaceLoop;
-    topLoop = tileSpaceLoop.getOperation();
+    if (rewriter)
+      rewriter->setInsertionPoint(topLoop);
+    AffineForOp newLoop = rewriter ? AffineForOp::create(*rewriter, loc, 0, 0)
+                                   : AffineForOp::create(b, loc, 0, 0);
+    if (rewriter)
+      rewriter->moveOpBefore(topLoop, newLoop.getBody()->getTerminator());
+    else
+      newLoop.getBody()->getOperations().splice(
+          newLoop.getBody()->begin(), topLoop->getBlock()->getOperations(),
+          topLoop);
+    if (isTileSpace) {
+      tiledLoops[tileLoopIndices[dim]] = newLoop;
+    } else {
+      tiledLoops[numTiledLoops + dim] = newLoop;
+      if (!innermostPointLoop)
+        innermostPointLoop = newLoop;
+    }
+    topLoop = newLoop;
   }
 
   // Move the loop body of the original nest to the new one.
-  moveLoopBody(origLoops.back(), innermostPointLoop);
+  if (rewriter) {
+    for (Operation &op : llvm::make_early_inc_range(
+             origLoops.back().getBody()->without_terminator()))
+      rewriter->moveOpBefore(&op,
+                             innermostPointLoop.getBody()->getTerminator());
+  } else {
+    moveLoopBody(origLoops.back(), innermostPointLoop);
+  }
 }
 
 /// Set lower and upper bounds of intra-tile loops for parametric tiling.
@@ -693,28 +758,51 @@ constructTiledIndexSetHyperRect(MutableArrayRef<AffineForOp> origLoops,
 
   OpBuilder b(origLoops[0].getOperation());
   unsigned width = origLoops.size();
+  unsigned numTiledLoops = llvm::count_if(
+      tileSizes, [](unsigned tileSize) { return tileSize != 0; });
 
   // Bounds for tile space loops.
-  for (unsigned i = 0; i < width; i++) {
+  unsigned tiledLoopIndex = 0;
+  for (unsigned i = 0; i < width; ++i) {
+    if (tileSizes[i] == 0)
+      continue;
     OperandRange newLbOperands = origLoops[i].getLowerBoundOperands();
     OperandRange newUbOperands = origLoops[i].getUpperBoundOperands();
-    newLoops[i].setLowerBound(newLbOperands, origLoops[i].getLowerBoundMap());
-    newLoops[i].setUpperBound(newUbOperands, origLoops[i].getUpperBoundMap());
+    newLoops[tiledLoopIndex].setLowerBound(newLbOperands,
+                                           origLoops[i].getLowerBoundMap());
+    newLoops[tiledLoopIndex].setUpperBound(newUbOperands,
+                                           origLoops[i].getUpperBoundMap());
     // If the step size of original loop is x and tileSize is y then after
     // tiling the tile space loops' step size becomes x*y.
-    newLoops[i].setStep(tileSizes[i] * origLoops[i].getStepAsInt());
+    newLoops[tiledLoopIndex].setStep(tileSizes[i] *
+                                     origLoops[i].getStepAsInt());
+    ++tiledLoopIndex;
   }
+
   // Bounds for intra-tile loops.
-  for (unsigned i = 0; i < width; i++) {
+  tiledLoopIndex = 0;
+  for (unsigned i = 0; i < width; ++i) {
+    AffineForOp newLoop = newLoops[numTiledLoops + i];
+    if (tileSizes[i] == 0) {
+      newLoop.setLowerBound(origLoops[i].getLowerBoundOperands(),
+                            origLoops[i].getLowerBoundMap());
+      newLoop.setUpperBound(origLoops[i].getUpperBoundOperands(),
+                            origLoops[i].getUpperBoundMap());
+      newLoop.setStep(origLoops[i].getStepAsInt());
+      continue;
+    }
+
     int64_t largestDiv = getLargestDivisorOfTripCount(origLoops[i]);
-    std::optional<uint64_t> mayBeConstantCount =
-        getConstantTripCount(origLoops[i]);
+    AffineForOp forOp = origLoops[i];
+    std::optional<uint64_t> mayBeConstantCount = std::nullopt;
+    if (auto staticTripCount = forOp.getStaticTripCount())
+      mayBeConstantCount = staticTripCount->getZExtValue();
     // The lower bound is just the tile-space loop.
     AffineMap lbMap = b.getDimIdentityMap();
-    newLoops[width + i].setLowerBound(
-        /*operands=*/newLoops[i].getInductionVar(), lbMap);
+    newLoop.setLowerBound(
+        /*operands=*/newLoops[tiledLoopIndex].getInductionVar(), lbMap);
     // The step sizes of intra-tile loops is just the original loops' step size.
-    newLoops[width + i].setStep(origLoops[i].getStepAsInt());
+    newLoop.setStep(origLoops[i].getStepAsInt());
 
     // Set the upper bound.
     if (mayBeConstantCount && *mayBeConstantCount < tileSizes[i]) {
@@ -722,8 +810,8 @@ constructTiledIndexSetHyperRect(MutableArrayRef<AffineForOp> origLoops,
       // trip count * stepSize.
       AffineMap ubMap = b.getSingleDimShiftAffineMap(
           *mayBeConstantCount * origLoops[i].getStepAsInt());
-      newLoops[width + i].setUpperBound(
-          /*operands=*/newLoops[i].getInductionVar(), ubMap);
+      newLoop.setUpperBound(
+          /*operands=*/newLoops[tiledLoopIndex].getInductionVar(), ubMap);
     } else if (largestDiv % tileSizes[i] != 0) {
       // Intra-tile loop ii goes from i to min(i + tileSize * stepSize, ub_i).
       // Construct the upper bound map; the operands are the original operands
@@ -740,7 +828,7 @@ constructTiledIndexSetHyperRect(MutableArrayRef<AffineForOp> origLoops,
         ubOperands.push_back(ub.getOperand(j));
 
       // Add dim operand for new loop upper bound.
-      ubOperands.push_back(newLoops[i].getInductionVar());
+      ubOperands.push_back(newLoops[tiledLoopIndex].getInductionVar());
 
       // Add symbol operands from original upper bound.
       for (unsigned j = 0, e = origUbMap.getNumSymbols(); j < e; ++j)
@@ -757,54 +845,338 @@ constructTiledIndexSetHyperRect(MutableArrayRef<AffineForOp> origLoops,
       AffineMap ubMap =
           AffineMap::get(origUbMap.getNumDims() + 1, origUbMap.getNumSymbols(),
                          boundExprs, b.getContext());
-      newLoops[width + i].setUpperBound(/*operands=*/ubOperands, ubMap);
+      newLoop.setUpperBound(/*operands=*/ubOperands, ubMap);
     } else {
       // No need of the min expression.
       AffineExpr dim = b.getAffineDimExpr(0);
       AffineMap ubMap = AffineMap::get(
           1, 0, dim + tileSizes[i] * origLoops[i].getStepAsInt());
-      newLoops[width + i].setUpperBound(newLoops[i].getInductionVar(), ubMap);
+      newLoop.setUpperBound(newLoops[tiledLoopIndex].getInductionVar(), ubMap);
     }
+    ++tiledLoopIndex;
   }
 }
 
-LogicalResult
-mlir::affine::tilePerfectlyNested(MutableArrayRef<AffineForOp> input,
-                                  ArrayRef<unsigned> tileSizes,
-                                  SmallVectorImpl<AffineForOp> *tiledNest) {
-  if (input.empty())
-    return success();
-
+LogicalResult mlir::affine::checkTilePerfectlyNestedPreconditions(
+    ArrayRef<AffineForOp> input, ArrayRef<unsigned> tileSizes) {
+  if (input.size() != tileSizes.size())
+    return failure();
   if (failed(performPreTilingChecks(input, tileSizes)))
     return failure();
 
+  for (auto [index, tileSize] : llvm::enumerate(tileSizes)) {
+    if (tileSize == 0)
+      continue;
+    AffineForOp loop = input[index];
+    if (!llvm::checkedMul<int64_t>(loop.getStepAsInt(), tileSize))
+      return failure();
+  }
+  return success();
+}
+
+LogicalResult mlir::affine::tilePerfectlyNested(
+    MutableArrayRef<AffineForOp> input, ArrayRef<unsigned> tileSizes,
+    SmallVectorImpl<AffineForOp> *tiledNest, RewriterBase *rewriter) {
+  if (input.size() != tileSizes.size())
+    return failure();
+  if (input.empty())
+    return success();
+
+  if (failed(checkTilePerfectlyNestedPreconditions(input, tileSizes)))
+    return failure();
+  if (llvm::all_of(tileSizes,
+                   [](unsigned tileSize) { return tileSize == 0; })) {
+    if (tiledNest)
+      tiledNest->assign(input.begin(), input.end());
+    return success();
+  }
+
   MutableArrayRef<AffineForOp> origLoops = input;
   AffineForOp rootAffineForOp = origLoops[0];
-
-  // Note that width is at least one since the band isn't empty.
+  unsigned numTiledLoops = llvm::count_if(
+      tileSizes, [](unsigned tileSize) { return tileSize != 0; });
   unsigned width = input.size();
-  SmallVector<AffineForOp, 6> tiledLoops(2 * width);
+  SmallVector<AffineForOp, 6> tiledLoops(numTiledLoops + width);
 
   // Construct a tiled loop nest without setting their bounds. Bounds are
   // set later.
-  constructTiledLoopNest(origLoops, rootAffineForOp, width, tiledLoops);
+  constructTiledLoopNest(origLoops, rootAffineForOp, tileSizes, tiledLoops,
+                         rewriter);
 
   SmallVector<Value, 8> origLoopIVs;
   extractForInductionVars(input, &origLoopIVs);
 
   // Set loop bounds for the tiled loop nest.
+  if (rewriter)
+    for (AffineForOp loop : tiledLoops)
+      rewriter->startOpModification(loop);
   constructTiledIndexSetHyperRect(origLoops, tiledLoops, tileSizes);
+  if (rewriter)
+    for (AffineForOp loop : tiledLoops)
+      rewriter->finalizeOpModification(loop);
 
   // Replace original IVs with intra-tile loop IVs.
   for (unsigned i = 0; i < width; i++)
-    origLoopIVs[i].replaceAllUsesWith(tiledLoops[i + width].getInductionVar());
+    if (rewriter)
+      rewriter->replaceAllUsesWith(
+          origLoopIVs[i], tiledLoops[numTiledLoops + i].getInductionVar());
+    else
+      origLoopIVs[i].replaceAllUsesWith(
+          tiledLoops[numTiledLoops + i].getInductionVar());
 
   // Erase the old loop nest.
-  rootAffineForOp.erase();
+  if (rewriter) {
+    for (AffineForOp loop : llvm::reverse(origLoops))
+      rewriter->eraseOp(loop);
+  } else {
+    rootAffineForOp.erase();
+  }
 
   if (tiledNest)
     *tiledNest = std::move(tiledLoops);
 
+  return success();
+}
+
+LogicalResult mlir::affine::checkTilePerfectlyNestedOrderedPreconditions(
+    ArrayRef<AffineForOp> input, ArrayRef<unsigned> dimensions,
+    ArrayRef<unsigned> tileSizes, ArrayRef<unsigned> pointDimensions) {
+  if (dimensions.size() != tileSizes.size())
+    return failure();
+  if (input.empty())
+    return success(dimensions.empty() && pointDimensions.empty());
+
+  if (!pointDimensions.empty()) {
+    if (pointDimensions.size() != input.size())
+      return failure();
+    SmallVector<unsigned> sortedPointDimensions(pointDimensions);
+    llvm::sort(sortedPointDimensions);
+    for (auto [position, dimension] : llvm::enumerate(sortedPointDimensions))
+      if (position != dimension)
+        return failure();
+  }
+
+  SmallVector<unsigned> structuralTileSizes(input.size(), 1);
+  if (failed(checkTilePerfectlyNestedPreconditions(input,
+                                                   structuralTileSizes)))
+    return failure();
+
+  for (auto [dimension, tileSize] :
+       llvm::zip_equal(dimensions, tileSizes)) {
+    if (dimension >= input.size() || tileSize == 0)
+      return failure();
+    AffineForOp loop = input[dimension];
+    if (!llvm::checkedMul<int64_t>(loop.getStepAsInt(), tileSize))
+      return failure();
+  }
+  return success();
+}
+
+static void setOrderedTileChildBounds(AffineForOp original,
+                                      AffineForOp parentTile,
+                                      unsigned parentTileSize,
+                                      std::optional<uint64_t> exactWindowSize,
+                                      AffineForOp child) {
+  OpBuilder builder(original);
+  child.setLowerBound(parentTile.getInductionVar(),
+                      builder.getDimIdentityMap());
+  child.setStep(original.getStepAsInt());
+
+  uint64_t windowSize = exactWindowSize.value_or(parentTileSize);
+  int64_t windowExtent = windowSize * original.getStepAsInt();
+  if (exactWindowSize) {
+    child.setUpperBound(
+        parentTile.getInductionVar(),
+        builder.getSingleDimShiftAffineMap(windowExtent));
+    return;
+  }
+
+  // Preserve the complete chain of enclosing tile boundaries. In particular,
+  // clipping only against the original upper bound would let a nested tile
+  // cross a non-dividing parent tile boundary.
+  AffineBound parentUb = parentTile.getUpperBound();
+  AffineMap parentUbMap = parentUb.getMap();
+  SmallVector<Value> operands;
+  operands.reserve(parentUb.getNumOperands() + 1);
+  llvm::append_range(
+      operands, parentUb.getOperands().take_front(parentUbMap.getNumDims()));
+  operands.push_back(parentTile.getInductionVar());
+  llvm::append_range(
+      operands, parentUb.getOperands().drop_front(parentUbMap.getNumDims()));
+
+  SmallVector<AffineExpr> bounds;
+  bounds.push_back(builder.getAffineDimExpr(parentUbMap.getNumDims()) +
+                   windowExtent);
+  llvm::append_range(bounds, parentUbMap.getResults());
+  child.setUpperBound(
+      operands, AffineMap::get(parentUbMap.getNumDims() + 1,
+                               parentUbMap.getNumSymbols(), bounds,
+                               builder.getContext()));
+}
+
+LogicalResult mlir::affine::tilePerfectlyNestedOrdered(
+    MutableArrayRef<AffineForOp> input, ArrayRef<unsigned> dimensions,
+    ArrayRef<unsigned> tileSizes, ArrayRef<unsigned> pointDimensions,
+    SmallVectorImpl<AffineForOp> *tiledNest, RewriterBase *rewriter) {
+  if (failed(checkTilePerfectlyNestedOrderedPreconditions(input, dimensions,
+                                                          tileSizes,
+                                                          pointDimensions)))
+    return failure();
+  if (input.empty())
+    return success();
+  if (dimensions.empty()) {
+    if (tiledNest)
+      tiledNest->assign(input.begin(), input.end());
+    return success();
+  }
+
+  unsigned numTileLoops = dimensions.size();
+  unsigned width = input.size();
+  SmallVector<unsigned> pointOrder;
+  if (pointDimensions.empty()) {
+    pointOrder.resize(width);
+    std::iota(pointOrder.begin(), pointOrder.end(), 0);
+  } else {
+    llvm::append_range(pointOrder, pointDimensions);
+  }
+  SmallVector<AffineForOp> newLoops(numTileLoops + width);
+  Operation *topLoop = input.front();
+  AffineForOp innermostPointLoop;
+
+  // Build the complete tile prefix and residual point band in one rewrite.
+  for (unsigned position = numTileLoops + width; position > 0; --position) {
+    unsigned index = position - 1;
+    OpBuilder builder(topLoop);
+    unsigned sourceDimension = index < numTileLoops
+                                   ? dimensions[index]
+                                   : pointOrder[index - numTileLoops];
+    Location location = input[sourceDimension].getLoc();
+    if (rewriter)
+      rewriter->setInsertionPoint(topLoop);
+    AffineForOp newLoop =
+        rewriter ? AffineForOp::create(*rewriter, location, 0, 0)
+                 : AffineForOp::create(builder, location, 0, 0);
+    if (rewriter)
+      rewriter->moveOpBefore(topLoop, newLoop.getBody()->getTerminator());
+    else
+      newLoop.getBody()->getOperations().splice(
+          newLoop.getBody()->begin(), topLoop->getBlock()->getOperations(),
+          topLoop);
+    unsigned resultIndex = index < numTileLoops
+                               ? index
+                               : numTileLoops + sourceDimension;
+    newLoops[resultIndex] = newLoop;
+    if (index >= numTileLoops && !innermostPointLoop)
+      innermostPointLoop = newLoop;
+    topLoop = newLoop;
+  }
+
+  if (rewriter) {
+    for (Operation &op : llvm::make_early_inc_range(
+             input.back().getBody()->without_terminator()))
+      rewriter->moveOpBefore(&op,
+                             innermostPointLoop.getBody()->getTerminator());
+  } else {
+    moveLoopBody(input.back(), innermostPointLoop);
+  }
+
+  struct TileWindowInfo {
+    uint64_t divisor;
+    std::optional<uint64_t> exactSize;
+  };
+  SmallVector<TileWindowInfo> currentWindows;
+  currentWindows.reserve(width);
+  for (AffineForOp loop : input) {
+    std::optional<uint64_t> exactSize;
+    if (std::optional<APInt> tripCount = loop.getStaticTripCount();
+        tripCount && tripCount->getActiveBits() <= 64)
+      exactSize = tripCount->getZExtValue();
+    currentWindows.push_back(
+        {getLargestDivisorOfTripCount(loop), exactSize});
+  }
+
+  SmallVector<TileWindowInfo> tileWindows;
+  tileWindows.reserve(numTileLoops);
+  for (auto [dimension, tileSize] :
+       llvm::zip_equal(dimensions, tileSizes)) {
+    TileWindowInfo current = currentWindows[dimension];
+    std::optional<uint64_t> exactSize;
+    if (current.exactSize && *current.exactSize < tileSize)
+      exactSize = current.exactSize;
+    else if (current.divisor % tileSize == 0)
+      exactSize = tileSize;
+
+    TileWindowInfo next =
+        exactSize
+            ? TileWindowInfo{*exactSize, exactSize}
+            : TileWindowInfo{std::gcd(current.divisor,
+                                      static_cast<uint64_t>(tileSize)),
+                             std::nullopt};
+    tileWindows.push_back(next);
+    currentWindows[dimension] = next;
+  }
+
+  SmallVector<std::optional<unsigned>> previousTile(width);
+  if (rewriter)
+    for (AffineForOp loop : newLoops)
+      rewriter->startOpModification(loop);
+  for (unsigned action = 0; action < numTileLoops; ++action) {
+    unsigned dimension = dimensions[action];
+    AffineForOp original = input[dimension];
+    AffineForOp tileLoop = newLoops[action];
+    if (!previousTile[dimension]) {
+      tileLoop.setLowerBound(original.getLowerBoundOperands(),
+                             original.getLowerBoundMap());
+      tileLoop.setUpperBound(original.getUpperBoundOperands(),
+                             original.getUpperBoundMap());
+    } else {
+      unsigned parentAction = *previousTile[dimension];
+      setOrderedTileChildBounds(original, newLoops[parentAction],
+                                tileSizes[parentAction],
+                                tileWindows[parentAction].exactSize, tileLoop);
+    }
+    tileLoop.setStep(tileSizes[action] * original.getStepAsInt());
+    previousTile[dimension] = action;
+  }
+
+  for (unsigned dimension = 0; dimension < width; ++dimension) {
+    AffineForOp original = input[dimension];
+    AffineForOp pointLoop = newLoops[numTileLoops + dimension];
+    if (!previousTile[dimension]) {
+      pointLoop.setLowerBound(original.getLowerBoundOperands(),
+                              original.getLowerBoundMap());
+      pointLoop.setUpperBound(original.getUpperBoundOperands(),
+                              original.getUpperBoundMap());
+      pointLoop.setStep(original.getStepAsInt());
+      continue;
+    }
+    unsigned parentAction = *previousTile[dimension];
+    setOrderedTileChildBounds(original, newLoops[parentAction],
+                              tileSizes[parentAction],
+                              tileWindows[parentAction].exactSize, pointLoop);
+  }
+  if (rewriter)
+    for (AffineForOp loop : newLoops)
+      rewriter->finalizeOpModification(loop);
+
+  for (unsigned dimension = 0; dimension < width; ++dimension) {
+    Value originalIv = input[dimension].getInductionVar();
+    Value pointIv = newLoops[numTileLoops + dimension].getInductionVar();
+    if (rewriter)
+      rewriter->replaceAllUsesWith(originalIv, pointIv);
+    else
+      originalIv.replaceAllUsesWith(pointIv);
+  }
+
+  if (rewriter) {
+    for (AffineForOp loop : llvm::reverse(input))
+      rewriter->eraseOp(loop);
+  } else {
+    input.front().erase();
+  }
+
+  if (tiledNest)
+    *tiledNest = std::move(newLoops);
   return success();
 }
 
@@ -824,10 +1196,12 @@ LogicalResult mlir::affine::tilePerfectlyNestedParametric(
   AffineForOp rootAffineForOp = origLoops[0];
   unsigned width = input.size();
   SmallVector<AffineForOp, 6> tiledLoops(2 * width);
+  SmallVector<unsigned> allDimensionsTiled(width, 1);
 
   // Construct a tiled loop nest without setting their bounds. Bounds are
   // set later.
-  constructTiledLoopNest(origLoops, rootAffineForOp, width, tiledLoops);
+  constructTiledLoopNest(origLoops, rootAffineForOp, allDimensionsTiled,
+                         tiledLoops, /*rewriter=*/nullptr);
 
   SmallVector<Value, 8> origLoopIVs;
   extractForInductionVars(input, &origLoopIVs);
@@ -869,9 +1243,9 @@ void mlir::affine::getPerfectlyNestedLoops(
 
 /// Unrolls this loop completely.
 LogicalResult mlir::affine::loopUnrollFull(AffineForOp forOp) {
-  std::optional<uint64_t> mayBeConstantTripCount = getConstantTripCount(forOp);
+  std::optional<APInt> mayBeConstantTripCount = forOp.getStaticTripCount();
   if (mayBeConstantTripCount.has_value()) {
-    uint64_t tripCount = *mayBeConstantTripCount;
+    uint64_t tripCount = mayBeConstantTripCount->getZExtValue();
     if (tripCount == 0)
       return success();
     if (tripCount == 1)
@@ -885,10 +1259,10 @@ LogicalResult mlir::affine::loopUnrollFull(AffineForOp forOp) {
 /// whichever is lower.
 LogicalResult mlir::affine::loopUnrollUpToFactor(AffineForOp forOp,
                                                  uint64_t unrollFactor) {
-  std::optional<uint64_t> mayBeConstantTripCount = getConstantTripCount(forOp);
+  std::optional<APInt> mayBeConstantTripCount = forOp.getStaticTripCount();
   if (mayBeConstantTripCount.has_value() &&
-      *mayBeConstantTripCount < unrollFactor)
-    return loopUnrollByFactor(forOp, *mayBeConstantTripCount);
+      mayBeConstantTripCount->ult(unrollFactor))
+    return loopUnrollByFactor(forOp, mayBeConstantTripCount->getZExtValue());
   return loopUnrollByFactor(forOp, unrollFactor);
 }
 
@@ -998,7 +1372,9 @@ LogicalResult mlir::affine::loopUnrollByFactor(
     bool cleanUpUnroll) {
   assert(unrollFactor > 0 && "unroll factor should be positive");
 
-  std::optional<uint64_t> mayBeConstantTripCount = getConstantTripCount(forOp);
+  std::optional<uint64_t> mayBeConstantTripCount = std::nullopt;
+  if (auto staticTripCount = forOp.getStaticTripCount())
+    mayBeConstantTripCount = staticTripCount->getZExtValue();
   if (unrollFactor == 1) {
     if (mayBeConstantTripCount == 1 && failed(promoteIfSingleIteration(forOp)))
       return failure();
@@ -1060,10 +1436,10 @@ LogicalResult mlir::affine::loopUnrollByFactor(
 
 LogicalResult mlir::affine::loopUnrollJamUpToFactor(AffineForOp forOp,
                                                     uint64_t unrollJamFactor) {
-  std::optional<uint64_t> mayBeConstantTripCount = getConstantTripCount(forOp);
+  std::optional<APInt> mayBeConstantTripCount = forOp.getStaticTripCount();
   if (mayBeConstantTripCount.has_value() &&
-      *mayBeConstantTripCount < unrollJamFactor)
-    return loopUnrollJamByFactor(forOp, *mayBeConstantTripCount);
+      mayBeConstantTripCount->getZExtValue() < unrollJamFactor)
+    return loopUnrollJamByFactor(forOp, mayBeConstantTripCount->getZExtValue());
   return loopUnrollJamByFactor(forOp, unrollJamFactor);
 }
 
@@ -1085,7 +1461,9 @@ LogicalResult mlir::affine::loopUnrollJamByFactor(AffineForOp forOp,
                                                   uint64_t unrollJamFactor) {
   assert(unrollJamFactor > 0 && "unroll jam factor should be positive");
 
-  std::optional<uint64_t> mayBeConstantTripCount = getConstantTripCount(forOp);
+  std::optional<uint64_t> mayBeConstantTripCount = std::nullopt;
+  if (auto staticTripCount = forOp.getStaticTripCount())
+    mayBeConstantTripCount = staticTripCount->getZExtValue();
   if (unrollJamFactor == 1) {
     if (mayBeConstantTripCount == 1 && failed(promoteIfSingleIteration(forOp)))
       return failure();
@@ -1315,12 +1693,14 @@ static bool checkLoopInterchangeDependences(
   // Example 1: [-1, 1][0, 0]
   // Example 2: [0, 0][-1, 1]
   for (const auto &depComps : depCompsVec) {
-    assert(depComps.size() >= maxLoopDepth);
+    if (depComps.size() < maxLoopDepth)
+      return false;
     // Check if the first non-zero dependence component is positive.
     // This iterates through loops in the desired order.
     for (unsigned j = 0; j < maxLoopDepth; ++j) {
       unsigned permIndex = loopPermMapInv[j];
-      assert(depComps[permIndex].lb);
+      if (!depComps[permIndex].lb)
+        return false;
       int64_t depCompLb = *depComps[permIndex].lb;
       if (depCompLb > 0)
         break;
@@ -1329,6 +1709,34 @@ static bool checkLoopInterchangeDependences(
     }
   }
   return true;
+}
+
+static LogicalResult getDependenceComponentsChecked(
+    AffineForOp root, unsigned maxLoopDepth,
+    std::vector<SmallVector<DependenceComponent, 2>> &dependences) {
+  SmallVector<Operation *> accesses;
+  root.walk([&](Operation *op) {
+    if (isa<AffineReadOpInterface, AffineWriteOpInterface>(op))
+      accesses.push_back(op);
+  });
+
+  for (unsigned depth = 1; depth <= maxLoopDepth; ++depth) {
+    for (Operation *source : accesses) {
+      MemRefAccess sourceAccess(source);
+      for (Operation *destination : accesses) {
+        MemRefAccess destinationAccess(destination);
+        SmallVector<DependenceComponent, 2> components;
+        DependenceResult result = checkMemrefAccessDependence(
+            sourceAccess, destinationAccess, depth,
+            /*dependenceConstraints=*/nullptr, &components);
+        if (result.value == DependenceResult::Failure)
+          return failure();
+        if (hasDependence(result))
+          dependences.push_back(std::move(components));
+      }
+    }
+  }
+  return success();
 }
 
 /// Checks if the loop interchange permutation 'loopPermMap' of the perfectly
@@ -1351,7 +1759,9 @@ bool mlir::affine::isValidLoopInterchangePermutation(
   // Gather dependence components for dependences between all ops in loop nest
   // rooted at 'loops[0]', at loop depths in range [1, maxLoopDepth].
   std::vector<SmallVector<DependenceComponent, 2>> depCompsVec;
-  getDependenceComponents(loops[0], maxLoopDepth, &depCompsVec);
+  if (failed(getDependenceComponentsChecked(loops[0], maxLoopDepth,
+                                            depCompsVec)))
+    return false;
   return checkLoopInterchangeDependences(depCompsVec, loops, loopPermMap);
 }
 
@@ -1600,6 +2010,92 @@ SmallVector<AffineForOp, 8> mlir::affine::tile(ArrayRef<AffineForOp> forOps,
   for (auto loops : tile(forOps, sizes, ArrayRef<AffineForOp>(target)))
     res.push_back(llvm::getSingleElement(loops));
   return res;
+}
+
+bool mlir::affine::isTilePerfectlyNestedOrderedValid(
+    ArrayRef<AffineForOp> input, ArrayRef<unsigned> dimensions,
+    ArrayRef<unsigned> tileSizes, ArrayRef<unsigned> pointDimensions) {
+  if (failed(checkTilePerfectlyNestedOrderedPreconditions(input, dimensions,
+                                                          tileSizes,
+                                                          pointDimensions)))
+    return false;
+  if (dimensions.empty())
+    return true;
+
+  AffineForOp inputRoot = input.front();
+
+  llvm::SetVector<Value> captures;
+  captures.insert(inputRoot->getOperands().begin(),
+                  inputRoot->getOperands().end());
+  MutableArrayRef<Region> regions = inputRoot->getRegions();
+  getUsedValuesDefinedAbove(regions, captures);
+
+  OwningOpRef<ModuleOp> scratch = ModuleOp::create(inputRoot.getLoc());
+  OpBuilder builder = OpBuilder::atBlockBegin(scratch.get().getBody());
+  SmallVector<Type> captureTypes =
+      llvm::map_to_vector(captures, [](Value value) { return value.getType(); });
+  auto function = func::FuncOp::create(
+      builder, inputRoot.getLoc(), "__mlir_affine_tiling_legality",
+      builder.getFunctionType(captureTypes, {}));
+  Block *entry = function.addEntryBlock();
+
+  IRMapping mapping;
+  for (auto [capture, argument] :
+       llvm::zip_equal(captures, entry->getArguments()))
+    mapping.map(capture, argument);
+  Operation *clonedRoot = inputRoot->clone(mapping);
+  entry->push_back(clonedRoot);
+  OpBuilder::atBlockEnd(entry).create<func::ReturnOp>(inputRoot.getLoc());
+
+  SmallVector<AffineForOp> loops;
+  getPerfectlyNestedLoops(loops, cast<AffineForOp>(clonedRoot));
+  unsigned tilePrefixSize = 0;
+  for (auto [dimension, tileSize] :
+       llvm::zip_equal(dimensions, tileSizes)) {
+    unsigned tilePosition = tilePrefixSize + dimension;
+    AffineForOp tileLoop = loops[tilePosition];
+    SmallVector<uint64_t> sizes = {tileSize};
+    SmallVector<AffineForOp> pointLoops =
+        affine::tile(ArrayRef<AffineForOp>(tileLoop), sizes, tileLoop);
+    loops.insert(loops.begin() + tilePosition + 1, pointLoops.front());
+
+    if (tilePosition == tilePrefixSize) {
+      ++tilePrefixSize;
+      continue;
+    }
+
+    SmallVector<unsigned> permutation(loops.size());
+    std::iota(permutation.begin(), permutation.end(), 0);
+    for (unsigned position = tilePrefixSize; position < tilePosition;
+         ++position)
+      permutation[position] = position + 1;
+    permutation[tilePosition] = tilePrefixSize;
+
+    if (!isValidLoopInterchangePermutation(loops, permutation))
+      return false;
+    unsigned rootIndex = permuteLoops(loops, permutation);
+    // `permuteLoops` returns the old-loop index of the new root. Rebuild the
+    // physical loop list from that operation after the permutation.
+    AffineForOp newRoot = loops[rootIndex];
+    loops.clear();
+    getPerfectlyNestedLoops(loops, newRoot);
+    ++tilePrefixSize;
+  }
+
+  if (!pointDimensions.empty()) {
+    SmallVector<unsigned> pointPositions(input.size());
+    for (auto [position, dimension] : llvm::enumerate(pointDimensions))
+      pointPositions[dimension] = position;
+
+    SmallVector<unsigned> permutation(loops.size());
+    std::iota(permutation.begin(), permutation.end(), 0);
+    for (unsigned dimension = 0; dimension < input.size(); ++dimension)
+      permutation[tilePrefixSize + dimension] =
+          tilePrefixSize + pointPositions[dimension];
+    if (!isValidLoopInterchangePermutation(loops, permutation))
+      return false;
+  }
+  return true;
 }
 
 LogicalResult mlir::affine::coalesceLoops(MutableArrayRef<AffineForOp> loops) {

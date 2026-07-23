@@ -24,6 +24,7 @@ namespace mlir {
 class AffineMap;
 class LoopLikeOpInterface;
 class OpBuilder;
+class RewriterBase;
 class Value;
 class ValueRange;
 
@@ -84,7 +85,8 @@ LogicalResult loopUnrollJamUpToFactor(AffineForOp forOp,
 
 /// Promotes the loop body of a AffineForOp to its containing block if the loop
 /// was known to have a single iteration.
-LogicalResult promoteIfSingleIteration(AffineForOp forOp);
+LogicalResult promoteIfSingleIteration(AffineForOp forOp,
+                                       RewriterBase *rewriter = nullptr);
 
 /// Promotes all single iteration AffineForOp's in the Function, i.e., moves
 /// their body into the containing Block.
@@ -99,12 +101,42 @@ LogicalResult affineForOpBodySkew(AffineForOp forOp, ArrayRef<uint64_t> shifts,
                                   bool unrollPrologueEpilogue = false);
 
 /// Tiles the specified band of perfectly nested loops creating tile-space loops
-/// and intra-tile loops. A band is a contiguous set of loops. This utility
-/// doesn't check for the validity of tiling itself, but just performs it.
+/// and intra-tile loops. A band is a contiguous set of loops. A tile size of
+/// zero retains the corresponding loop without strip-mining it. The returned
+/// nest contains tile-space loops for nonzero sizes followed by one intra-tile
+/// or retained loop for every input dimension.
+///
+/// Returns success if `input` can be tiled with `tileSizes`. This checks the
+/// structural requirements of `tilePerfectlyNested`, nonnegative tile sizes,
+/// and whether the resulting loop steps are representable.
+LogicalResult
+checkTilePerfectlyNestedPreconditions(ArrayRef<AffineForOp> input,
+                                      ArrayRef<unsigned> tileSizes);
+
 LogicalResult
 tilePerfectlyNested(MutableArrayRef<AffineForOp> input,
                     ArrayRef<unsigned> tileSizes,
-                    SmallVectorImpl<AffineForOp> *tiledNest = nullptr);
+                    SmallVectorImpl<AffineForOp> *tiledNest = nullptr,
+                    RewriterBase *rewriter = nullptr);
+
+/// Tiles dimensions of a perfect loop nest in the given scheduling order.
+/// Dimension indices refer to the original `input` nest and may be repeated.
+/// The returned nest contains tile loops in scheduling order followed by one
+/// final point loop per input dimension in source order.
+LogicalResult checkTilePerfectlyNestedOrderedPreconditions(
+    ArrayRef<AffineForOp> input, ArrayRef<unsigned> dimensions,
+    ArrayRef<unsigned> tileSizes, ArrayRef<unsigned> pointDimensions = {});
+
+bool isTilePerfectlyNestedOrderedValid(ArrayRef<AffineForOp> input,
+                                       ArrayRef<unsigned> dimensions,
+                                       ArrayRef<unsigned> tileSizes,
+                                       ArrayRef<unsigned> pointDimensions = {});
+
+LogicalResult tilePerfectlyNestedOrdered(
+    MutableArrayRef<AffineForOp> input, ArrayRef<unsigned> dimensions,
+    ArrayRef<unsigned> tileSizes, ArrayRef<unsigned> pointDimensions = {},
+    SmallVectorImpl<AffineForOp> *tiledNest = nullptr,
+    RewriterBase *rewriter = nullptr);
 
 /// Tiles the specified band of perfectly nested loops creating tile-space
 /// loops and intra-tile loops, using SSA values as tiling parameters. A band

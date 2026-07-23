@@ -214,27 +214,9 @@ void mlir::affine::getTripCountMapAndOperands(
 /// getTripCount) and is able to determine constant trip count in non-trivial
 /// cases.
 std::optional<uint64_t> mlir::affine::getConstantTripCount(AffineForOp forOp) {
-  SmallVector<Value, 4> operands;
-  AffineMap map;
-  getTripCountMapAndOperands(forOp, &map, &operands);
-
-  if (!map)
-    return std::nullopt;
-
-  // Take the min if all trip counts are constant.
-  std::optional<uint64_t> tripCount;
-  for (auto resultExpr : map.getResults()) {
-    if (auto constExpr = dyn_cast<AffineConstantExpr>(resultExpr)) {
-      if (tripCount.has_value())
-        tripCount =
-            std::min(*tripCount, static_cast<uint64_t>(constExpr.getValue()));
-      else
-        tripCount = constExpr.getValue();
-    } else {
-      return std::nullopt;
-    }
-  }
-  return tripCount;
+  if (std::optional<APInt> tripCount = forOp.getStaticTripCount())
+    return tripCount->getZExtValue();
+  return std::nullopt;
 }
 
 /// Returns the greatest known integral divisor of the trip count. Affine
@@ -529,7 +511,8 @@ bool mlir::affine::isTilingValid(ArrayRef<AffineForOp> loops) {
 
   unsigned numOps = loadAndStoreOps.size();
   unsigned numLoops = loops.size();
-  for (unsigned d = 1; d <= numLoops + 1; ++d) {
+  unsigned rootDepth = getNestingDepth(loops.front());
+  for (unsigned d = rootDepth + 1; d <= rootDepth + numLoops + 1; ++d) {
     for (unsigned i = 0; i < numOps; ++i) {
       Operation *srcOp = loadAndStoreOps[i];
       MemRefAccess srcAccess(srcOp);
@@ -541,6 +524,11 @@ bool mlir::affine::isTilingValid(ArrayRef<AffineForOp> loops) {
         DependenceResult result = checkMemrefAccessDependence(
             srcAccess, dstAccess, d, /*dependenceConstraints=*/nullptr,
             &depComps);
+
+        // Conservatively reject tiling when dependence analysis cannot prove
+        // whether the transformation is legal.
+        if (result.value == DependenceResult::Failure)
+          return false;
 
         // Skip if there is no dependence in this case.
         if (!hasDependence(result))
@@ -557,7 +545,7 @@ bool mlir::affine::isTilingValid(ArrayRef<AffineForOp> loops) {
                               OpPrintingFlags().skipRegions());
         for (const DependenceComponent &depComp : depComps) {
           if (depComp.lb.has_value() && depComp.ub.has_value() &&
-              *depComp.lb < *depComp.ub && *depComp.ub < 0) {
+              *depComp.ub < 0) {
             LDBG() << "Dependence component lb = " << Twine(*depComp.lb)
                    << " ub = " << Twine(*depComp.ub)
                    << " is negative  at depth: " << Twine(d)
