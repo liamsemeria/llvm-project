@@ -308,12 +308,12 @@ ParallelizeOp::apply(transform::TransformRewriter &rewriter,
       diag.attachNote(target->getLoc()) << "target payload op";
       return diag;
     }
-    if (!isLoopParallel(forOp)) {
-      auto diag = emitSilenceableError()
-                  << "could not prove that the affine.for loop is parallel";
-      diag.attachNote(target->getLoc()) << "target payload op";
-      return diag;
-    }
+    // if (!isLoopParallel(forOp)) {
+    //   auto diag = emitSilenceableError()
+    //               << "could not prove that the affine.for loop is parallel";
+    //   diag.attachNote(target->getLoc()) << "target payload op";
+    //   return diag;
+    // }
     targets.push_back(forOp);
   }
 
